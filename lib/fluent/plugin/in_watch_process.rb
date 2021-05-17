@@ -10,11 +10,13 @@ module Fluent::Plugin
     helpers :timer
 
     DEFAULT_KEYS = %w(start_time user pid parent_pid cpu_time cpu_percent memory_percent mem_rss mem_size state proc_name command)
+    DEFAULT_KEYS_WIN32 = %w(StartTime UserName SessionId Id CPU WorkingSet VirtualMemorySize HandleCount ProcessName)
+
     DEFAULT_TYPES = "pid:integer,parent_pid:integer,cpu_percent:float,memory_percent:float,mem_rss:integer,mem_size:integer"
 
     config_param :tag, :string
     config_param :command, :string, :default => nil
-    config_param :keys, :array, :default => DEFAULT_KEYS
+    config_param :keys, :array, :default => nil
     config_param :interval, :time, :default => '5s'
     config_param :lookup_user, :array, :default => nil
     config_param :hostname_command, :string, :default => 'hostname'
@@ -31,6 +33,7 @@ module Fluent::Plugin
     def configure(conf)
       super
 
+      @keys = @keys || (OS.windows? ? DEFAULT_KEYS_WIN32 : DEFAULT_KEYS)
       @command = @command || get_ps_command
       log.info "watch_process: polling start. :tag=>#{@tag} :lookup_user=>#{@lookup_user} :interval=>#{@interval} :command=>#{@command}"
     end
@@ -48,16 +51,12 @@ module Fluent::Plugin
       io = IO.popen(@command, 'r')
       io.gets
       while result = io.gets
-        keys_size = @keys.size
-        if result =~ /(?<lstart>(^\w+\s+\w+\s+\d+\s+\d\d:\d\d:\d\d \d+))/
-          lstart = Time.parse($~[:lstart])
-          result = result.sub($~[:lstart], '')
-          keys_size -= 1
+        if OS.windows?
+            data = parse_line_win32(result)
+        else
+            data = parse_line(result)
         end
-        values = [lstart.to_s, result.chomp.strip.split(/\s+/, keys_size)]
-        data = Hash[@keys.zip(values.reject(&:empty?).flatten)]
-        data['elapsed_time'] = (Time.now - Time.parse(data['start_time'])).to_i if data['start_time']
-        next unless @lookup_user.nil? || @lookup_user.include?(data['user'])
+        next if data.nil?
         emit_tag = tag.dup
         filter_record(emit_tag, Fluent::Engine.now, data)
         router.emit(emit_tag, Fluent::Engine.now, data)
@@ -67,12 +66,51 @@ module Fluent::Plugin
       log.error "watch_process: error has occured. #{e.message}"
     end
 
+    def parse_line(result)
+        keys_size = @keys.size
+        if result =~ /(?<lstart>(^\w+\s+\w+\s+\d+\s+\d\d:\d\d:\d\d \d+))/
+          lstart = Time.parse($~[:lstart])
+          result = result.sub($~[:lstart], '')
+          keys_size -= 1
+        end
+        values = [lstart.to_s, result.chomp.strip.split(/\s+/, keys_size)]
+        data = Hash[@keys.zip(values.reject(&:empty?).flatten)]
+        data['elapsed_time'] = (Time.now - Time.parse(data['start_time'])).to_i if data['start_time']
+        unless @lookup_user.nil? || @lookup_user.include?(data['user'])
+          return
+        end
+        return data
+    end
+
+    def parse_line_win32(result)
+        data = JSON.parse(result)
+        if data["StartTime"].nil? || data["CPU"].nil?
+            return
+        end
+        start = Time.strptime(data['StartTime'], "/Date(%Q)/")
+        data['StartTime'] = start.to_s
+        data['ElapsedTime'] = (Time.now - start).to_i
+        data = data.select { |k, v| @keys.include?(k) }
+        return data
+    end
+
     def get_ps_command
       if OS.linux?
         "LANG=en_US.UTF-8 && ps -ewwo lstart,user:20,pid,ppid,time,%cpu,%mem,rss,sz,s,comm,cmd"
       elsif OS.mac?
         "LANG=en_US.UTF-8 && ps -ewwo lstart,user,pid,ppid,time,%cpu,%mem,rss,vsz,state,comm,command"
+      elsif OS.windows?
+        get_ps_command_win32()
       end
+    end
+
+    def get_ps_command_win32
+      command = [
+        "Get-Process",
+        " | Select-Object -Property #{@keys.join(',')}",
+        " | ForEach { ConvertTo-JSON -Compress $_; }"
+      ].join
+      "powershell -command \"#{command}\""
     end
 
     module OS
